@@ -1238,6 +1238,7 @@ class App:
             "chars": len(text),
             "raw": info.get("raw", text),
             "final": text,
+            "wav": info.get("wav", ""),
         })
         with self.lock:
             if sid == self.session_id:
