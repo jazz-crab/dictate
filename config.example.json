@@ -1,0 +1,50 @@
+{
+  "hotkey": "ctrl+alt+d",
+  "hotkey_raw": "ctrl+alt+s",
+  "input_device": "",
+  "sample_rate": 16000,
+  "max_seconds": 3600,
+  "min_seconds": 0.4,
+  "overlay": true,
+  "beeps": true,
+  "save_audio": false,
+  "ollama_exe": "ollama/ollama.exe",
+  "ollama_url": "http://127.0.0.1:11434",
+  "whisper": {
+    "model_dir": "models/small",
+    "device": "cpu",
+    "compute_type": "int8",
+    "beam_size": 1,
+    "language": "ru",
+    "threads": 4,
+    "vad": true,
+    "vad_threshold": 0.35,
+    "vad_min_silence_ms": 500,
+    "vad_speech_pad_ms": 500
+  },
+  "llm": {
+    "enabled": true,
+    "model": "gemma4:e4b-it-q4_K_M",
+    "fallback_model": "qwen2.5:1.5b-instruct-q4_K_M",
+    "think": false,
+    "flash_attention": true,
+    "kv_cache_type": "q8_0",
+    "timeout_s": 180,
+    "keep_alive": "30m",
+    "num_ctx": 4096,
+    "chunk_chars": 2200,
+    "temperature": 0.3,
+    "min_ratio": 0.30,
+    "max_ratio": 1.80,
+    "min_smart_chars": 200
+  },
+  "inject": {
+    "mode": "paste",
+    "paste_combo": "ctrl+v",
+    "delay_ms": 120,
+    "keep_in_clipboard": true,
+    "auto_submit": true,
+    "submit_combo": "enter",
+    "submit_delay_ms": 450
+  }
+}

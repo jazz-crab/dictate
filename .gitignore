@@ -1,0 +1,17 @@
+.venv/
+logs/
+__pycache__/
+models/
+ollama/lib/
+ollama/models/
+ollama/*.exe
+ffmpeg/
+*.wav
+*.ogg
+fake-*.out
+fake.err.log
+fake.out.log
+note.txt
+test-ru*.ogg
+config.json
+start-dictate.vbs
