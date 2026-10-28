@@ -17,8 +17,8 @@
     "beam_size": 1,
     "language": "ru",
     "threads": 4,
-    "vad": true,
-    "vad_threshold": 0.10,
+    "vad": false,
+    "vad_threshold": 0.1,
     "vad_min_silence_ms": 500,
     "vad_speech_pad_ms": 1000
   },
@@ -34,8 +34,8 @@
     "num_ctx": 4096,
     "chunk_chars": 2200,
     "temperature": 0.3,
-    "min_ratio": 0.30,
-    "max_ratio": 1.80,
+    "min_ratio": 0.3,
+    "max_ratio": 1.8,
     "min_smart_chars": 200
   },
   "inject": {

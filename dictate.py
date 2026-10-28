@@ -107,7 +107,9 @@ DEFAULTS = {
             "ollama, nginx, systemd, ssh, git commit, TODO, API, whisper, "
             "todo.md, python, windows, docker, JSON, cron, bash, CLI."
         ),
-        "vad": True,
+        # VAD выключен: silero даже с низким порогом вырезал тихое начало
+        # фразы. Без него whisper получает запись целиком.
+        "vad": False,
         # Порог VAD сильно ниже стандартного 0.5: тихая речь в начале фразы
         # иначе принимается за шум и вырезается (проверено на реальной
         # диктовке: при 0.35 пропали первые две фразы, при 0.10 текст
