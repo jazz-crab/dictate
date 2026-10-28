@@ -99,7 +99,7 @@ DEFAULTS = {
         "model_dir": str(APP_DIR / "models" / "small"),
         "device": "cpu",
         "compute_type": "int8",
-        "beam_size": 1,
+        "beam_size": 5,
         "language": "ru",
         "threads": 4,
         "initial_prompt": (
@@ -629,7 +629,10 @@ class Transcriber:
             },
             initial_prompt=self.cfg["initial_prompt"] or None,
             condition_on_previous_text=False,
-            without_timestamps=True,
+            # Таймстемпы и beam=5 дают заметно более полный текст: на
+            # трёхминутной диктовке greedy без таймстемпов терял целые
+            # фразы из середины.
+            without_timestamps=False,
         )
         text = " ".join(seg.text.strip() for seg in segments).strip()
         return text, getattr(info, "language_probability", None)
