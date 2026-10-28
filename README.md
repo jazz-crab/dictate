@@ -136,7 +136,9 @@ install.ps1 ставит зависимости в `.venv`, генерирует
 ## Настройка (config.json)
 
 - `input_device` — подстрока имени микрофона; пусто = устройство по
-  умолчанию. Список: `python dictate.py --devices`.
+  умолчанию. Список: `python dictate.py --devices`. Если микрофон подключили
+  после запуска (или он переподключался), приложение перечитывает список
+  устройств PortAudio и пробует открыть поток заново.
 - `whisper.model_dir` / `language` / `threads` / `initial_prompt`.
 - `llm.model` / `llm.fallback_model`; `llm.enabled: false` — кнопка
   формулировки отключена.

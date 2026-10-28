@@ -401,8 +401,31 @@ def list_input_devices():
     return rows
 
 
+def refresh_audio_devices():
+    """Перечитать список устройств.
+
+    PortAudio кэширует устройства с момента Pa_Initialize: если приложение
+    стартовало до того, как USB-микрофон появился в системе (автозапуск при
+    входе), список остаётся пустым до конца жизни процесса. Terminate +
+    initialize заставляет перечитать его.
+    """
+    try:
+        import sounddevice as sd
+        sd._terminate()
+        sd._initialize()
+        log.info("список аудиоустройств перечитан")
+        return True
+    except Exception as exc:
+        log.warning("не смог перечитать аудиоустройства: %s", exc)
+        return False
+
+
 def pick_device(pattern):
     devices = list_input_devices()
+    if not devices:
+        # Похоже на устаревший кэш PortAudio — обновляем и пробуем ещё раз.
+        if refresh_audio_devices():
+            devices = list_input_devices()
     if not devices:
         return None
     if pattern:
@@ -427,17 +450,6 @@ def record_session(stop_ev, cancel_ev, on_tick, on_ready=None):
     import sounddevice as sd
 
     cfg = CONFIG
-    picked = pick_device(cfg["input_device"])
-    if picked is None:
-        raise RuntimeError("нет ни одного устройства записи (микрофон не подключён?)")
-    idx, name, api, native_rate = picked
-    rate = int(cfg["sample_rate"])
-    try:
-        sd.check_input_settings(device=idx, samplerate=rate, channels=1, dtype="float32")
-    except Exception:
-        rate = int(native_rate)
-    log.info("запись: [%s] %s (%s), %s Гц", idx, name, api, rate)
-
     blocks = []
     marks = {}
     t0 = time.time()
@@ -451,8 +463,36 @@ def record_session(stop_ev, cancel_ev, on_tick, on_ready=None):
             marks["first"] = time.time() - t0
         blocks.append(indata.copy())
 
-    with sd.InputStream(device=idx, samplerate=rate, channels=1,
-                        dtype="float32", blocksize=0, callback=callback):
+    state = {}
+
+    def open_stream():
+        picked = pick_device(cfg["input_device"])
+        if picked is None:
+            raise RuntimeError("нет ни одного устройства записи (микрофон не подключён?)")
+        idx, name, api, native_rate = picked
+        rate = int(cfg["sample_rate"])
+        try:
+            sd.check_input_settings(device=idx, samplerate=rate, channels=1, dtype="float32")
+        except Exception:
+            rate = int(native_rate)
+        log.info("запись: [%s] %s (%s), %s Гц", idx, name, api, rate)
+        stream = sd.InputStream(device=idx, samplerate=rate, channels=1,
+                                dtype="float32", blocksize=0, callback=callback)
+        stream.start()
+        state["rate"] = rate
+        return stream
+
+    try:
+        stream = open_stream()
+    except Exception as exc:
+        # Микрофон мог появиться после старта приложения (USB) или
+        # переподключиться: обновляем список устройств и пробуем ещё раз.
+        log.warning("не открыл микрофон (%s) — обновляю устройства", exc)
+        if not refresh_audio_devices():
+            raise
+        stream = open_stream()
+
+    try:
         marks["open"] = time.time() - t0
         log.info("микрофон открыт за %.0f мс", marks["open"] * 1000)
         # Сигнал и «ЗАПИСЬ» — только когда поток реально открыт, иначе
@@ -465,13 +505,20 @@ def record_session(stop_ev, cancel_ev, on_tick, on_ready=None):
         started = time.time()
         while not stop_ev.is_set():
             if cancel_ev.is_set() or (user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000):
-                return None, rate, "cancel"
+                return None, state["rate"], "cancel"
             elapsed = time.time() - started
             if elapsed > cfg["max_seconds"]:
                 break
             on_tick(elapsed)
             time.sleep(0.2)
+    finally:
+        try:
+            stream.stop()
+            stream.close()
+        except Exception:
+            pass
 
+    rate = state["rate"]
     if "first" in marks:
         log.info("первый блок с микрофона через %.0f мс", marks["first"] * 1000)
     else:
