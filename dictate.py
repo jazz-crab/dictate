@@ -1,19 +1,24 @@
 """Локальный голосовой ввод для Windows.
 
 Цепочка:
-    микрофон -> faster-whisper (CPU, int8) -> окно правки поверх всех окон
-    -> «В opencode» (вставка + Enter) или «Умная формулировка» (локальная LLM)
-    -> снова окно с готовым текстом.
+    микрофон -> faster-whisper (CPU, int8) -> окно, в котором текст появляется
+    по мере диктовки (живой черновик) -> стоп -> финальное распознавание
+    -> правка и «Копировать в буфер» (или «Умная формулировка» — локальная LLM).
 
 Текст никогда не отправляется сам: сначала его видно и можно поправить.
 
 Хоткеи по умолчанию:
-    Ctrl+Alt+D   диктовка с окном правки (обычный режим)
-    Ctrl+Alt+S   быстрый ввод: распознал, вставил и всё — без окна и без Enter
-    Esc          отменить запись / закрыть окно правки
+    Ctrl+Alt+D         диктовка: окно открывается сразу и показывает живой
+                       черновик; Esc — отмена, затем правка и копирование
+    Ctrl+Alt+Shift+D   главное окно: история записей со статистикой, лог
+    Ctrl+Alt+S         быстрый ввод: распознал, вставил и всё — без окна и без Enter
 
-Запуск без окна: pythonw.exe dictate.py
-Проверка на файле: python dictate.py --test file.wav [--raw]
+Удаление в окне — единое в живом режиме и в режиме правки:
+    Backspace                     один символ (в живом режиме — и кусок аудио)
+    Ctrl/Alt+Backspace            слово
+    Ctrl/Alt+Shift+Backspace      фразу (до точки/знака или до переноса строки)
+    Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y  отмена / повтор (история 100 шагов)
+    Ctrl+C / Ctrl+Shift+C         выделенное / весь текст в буфер
 """
 
 import argparse
@@ -27,7 +32,7 @@ import sys
 import threading
 import time
 from ctypes import wintypes
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
@@ -84,6 +89,7 @@ log = logging.getLogger("dictate")
 
 DEFAULTS = {
     "hotkey": "ctrl+alt+d",
+    "hotkey_main": "ctrl+alt+shift+d",
     "hotkey_raw": "ctrl+alt+s",
     "input_device": "",
     "sample_rate": 16000,
@@ -95,6 +101,17 @@ DEFAULTS = {
     "save_audio": False,
     "ollama_exe": str(APP_DIR / "ollama" / "ollama.exe"),
     "ollama_url": "http://127.0.0.1:11434",
+    # Живое распознавание: во время записи фоновый тред раз в interval_s
+    # заново распознаёт хвост записи (context_s уже замороженного аудио +
+    # то, что сказано после). Всё, что старше draft_s секунд, «замораживается»
+    # в подтверждённый текст, свежий хвост показывается акцентным цветом.
+    # На CPU это ~10-секундные обновления; с ускоренным ASR станет быстрее.
+    "live": {
+        "enabled": True,
+        "draft_s": 4.0,
+        "interval_s": 9.0,
+        "context_s": 2.0,
+    },
     "whisper": {
         "model_dir": str(APP_DIR / "models" / "small"),
         "device": "cpu",
@@ -233,6 +250,7 @@ def beep(kind):
         "stop": [(520, 70)],
         "done": [(880, 60), (0, 40), (1100, 60)],
         "error": [(300, 200)],
+        "tick": [(600, 30)],
     }
     def run():
         try:
@@ -449,7 +467,7 @@ def pick_device(pattern):
     return devices[0]
 
 
-def record_session(stop_ev, cancel_ev, on_tick, on_ready=None):
+def record_session(stop_ev, cancel_ev, on_tick, on_ready=None, on_frame=None):
     import numpy as np
     import sounddevice as sd
 
@@ -465,7 +483,14 @@ def record_session(stop_ev, cancel_ev, on_tick, on_ready=None):
             # Сколько прошло от «пора писать» до первого сэмпла: если начало
             # теряется на устройстве, это будет видно здесь.
             marks["first"] = time.time() - t0
-        blocks.append(indata.copy())
+        block = indata.copy()
+        blocks.append(block)
+        if on_frame is not None:
+            # Живой движок копирует блок в свой буфер (свой лок внутри).
+            try:
+                on_frame(block, state["rate"])
+            except Exception:
+                log.exception("on_frame в записи сорвался")
 
     state = {}
 
@@ -585,6 +610,9 @@ class Transcriber:
         self.cfg = cfg["whisper"]
         self._model = None
         self._lock = threading.Lock()
+        # Раздельная блокировка инференса: живой тред, финальный проход и
+        # --test не должны звать model.transcribe() одновременно.
+        self._infer = threading.Lock()
 
     def _load(self):
         if self._model is not None:
@@ -613,29 +641,39 @@ class Transcriber:
         except Exception as exc:
             log.exception("прогрев whisper не удался: %s", exc)
 
-    def transcribe(self, audio):
+    def transcribe_segments(self, audio):
+        """Распознавание со списком сегментов: [(start_s, end_s, text), ...].
+
+        Таймстемпы нужны живому режиму (раздел текста на «уже сказано» и
+        «говорящее сейчас») — и без VAD, который режет тихие фразы.
+        """
         model = self._load()
-        segments, info = model.transcribe(
-            audio,
-            language=self.cfg["language"] or None,
-            beam_size=int(self.cfg["beam_size"]),
-            vad_filter=bool(self.cfg["vad"]),
-            # Мягче стандартного: тихую речь в начале фразы VAD иначе
-            # отрезает как шум, и первые слова пропадают.
-            vad_parameters={
-                "threshold": float(self.cfg.get("vad_threshold", 0.35)),
-                "min_silence_duration_ms": int(self.cfg.get("vad_min_silence_ms", 500)),
-                "speech_pad_ms": int(self.cfg.get("vad_speech_pad_ms", 500)),
-            },
-            initial_prompt=self.cfg["initial_prompt"] or None,
-            condition_on_previous_text=False,
-            # Таймстемпы и beam=5 дают заметно более полный текст: на
-            # трёхминутной диктовке greedy без таймстемпов терял целые
-            # фразы из середины.
-            without_timestamps=False,
-        )
-        text = " ".join(seg.text.strip() for seg in segments).strip()
-        return text, getattr(info, "language_probability", None)
+        with self._infer:
+            segments, info = model.transcribe(
+                audio,
+                language=self.cfg["language"] or None,
+                beam_size=int(self.cfg["beam_size"]),
+                vad_filter=bool(self.cfg["vad"]),
+                vad_parameters={
+                    "threshold": float(self.cfg.get("vad_threshold", 0.35)),
+                    "min_silence_duration_ms": int(self.cfg.get("vad_min_silence_ms", 500)),
+                    "speech_pad_ms": int(self.cfg.get("vad_speech_pad_ms", 500)),
+                },
+                initial_prompt=self.cfg["initial_prompt"] or None,
+                condition_on_previous_text=False,
+                # Таймстемпы и beam=5 дают заметно более полный текст: на
+                # трёхминутной диктовке greedy без таймстемпов терял целые
+                # фразы из середины.
+                without_timestamps=False,
+            )
+            segments = [s for s in segments if s.text.strip()]
+        prob = getattr(info, "language_probability", None)
+        return [(s.start, s.end, s.text.strip()) for s in segments], prob
+
+    def transcribe(self, audio):
+        segments, prob = self.transcribe_segments(audio)
+        text = " ".join(t for _, _, t in segments).strip()
+        return text, prob
 
 
 class Cleaner:
@@ -898,6 +936,260 @@ def llm_output_ok(raw, out, cfg):
     return True, ""
 
 
+def _suffix_chars(text, old_ratio):
+    """Сегмент частично лежит в уже подтверждённом: оставляем свежий хвост."""
+    if old_ratio <= 0.02:
+        return text
+    if old_ratio >= 0.98:
+        return ""
+    return text[int(len(text) * old_ratio):].strip()
+
+
+class LiveSession:
+    """Живая диктовка: буфер аудио + фоновое распознавание хвоста.
+
+    Схема:
+      * микрофон сливает блоки в self.chunks (в нативном rate устройства);
+      * раз в interval_s тред заново распознаёт хвост: context_s уже
+        замороженного аудио + всё, что сказано после;
+      * речь старше draft_s «замораживается» в self.confirmed, свежий хвост
+        идёт в self.draft (в окне — акцентным цветом);
+      * Backspace / Ctrl+Backspace срезают последнее слово/предложение и из
+        текста, и из аудио — запись продолжается, удалённое не вернётся.
+
+    Все позиции — в секундах; точность «символ -> время» приблизительная
+    (по таймстампам сегментов), финальный проход при остановке всё верифицирует.
+    """
+
+    def __init__(self, app, sid):
+        self.app = app
+        self.sid = sid
+        self.cfg = app.cfg.get("live", {})
+        self.rate = 0
+        self.lock = threading.RLock()
+        self.chunks = []
+        self.n = 0              # сэмплов
+        self.t = 0.0            # секунд записано
+        self.confirmed = ""
+        self.draft = ""
+        self.cut_s = 0.0        # сколько секунд уже заморожено
+        self.frozen_segs = []   # (start_s, end_s, text) под confirmed
+        self.draft_segs = []
+        self._busy = False
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name="live", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def on_frame(self, block, rate):
+        import numpy as np
+        with self.lock:
+            if not self.rate:
+                self.rate = int(rate)
+            data = np.asarray(block, dtype="float32").reshape(-1)
+            self.chunks.append(data)
+            self.n += int(data.shape[0])
+            self.t = self.n / self.rate
+
+    # ── доступ к аудио ──
+
+    def _slice(self, t0, t1):
+        """Аудио [t0..t1] секунд -> float32 16 кГц. Вызывать под self.lock."""
+        import numpy as np
+        if not self.rate:
+            return np.zeros(0, dtype="float32")
+        a = max(0, int(t0 * self.rate))
+        b = min(self.n, int(t1 * self.rate))
+        if a >= b:
+            return np.zeros(0, dtype="float32")
+        out, pos = [], 0
+        for ch in self.chunks:
+            cl = len(ch)
+            if pos + cl <= a:
+                pos += cl
+                continue
+            if pos >= b:
+                break
+            s, e = max(0, a - pos), min(cl, b - pos)
+            out.append(ch[s:e])
+            pos += cl
+        raw = np.concatenate(out) if out else np.zeros(0, dtype="float32")
+        if self.rate == 16000:
+            return raw
+        return resample(raw, self.rate, 16000)
+
+    def _truncate(self, t_cut):
+        """Обрезать буфер до t_cut секунд. Вызывать под self.lock."""
+        n_keep = max(0, min(self.n, int(t_cut * self.rate)))
+        k = self.n - n_keep
+        while k > 0 and self.chunks:
+            ch = self.chunks[-1]
+            if k >= len(ch):
+                k -= len(ch)
+                self.chunks.pop()
+            else:
+                self.chunks[-1] = ch[:-k]
+                k = 0
+        self.n = n_keep
+        self.t = n_keep / self.rate if self.rate else 0.0
+
+    def take_all(self):
+        """Весь буфер -> float32 16 кГц (для финального прохода и wav)."""
+        import numpy as np
+        with self.lock:
+            if not self.chunks:
+                return np.zeros(0, dtype="float32")
+            raw = np.concatenate(self.chunks)
+        if self.rate == 16000:
+            return raw
+        return resample(raw, self.rate, 16000)
+
+    def display_text(self):
+        with self.lock:
+            return (self.confirmed + " " + self.draft).strip()
+
+    # ── цикл распознавания ──
+
+    def _run(self):
+        last = 0.0
+        interval = float(self.cfg.get("interval_s", 9))
+        while not self._stop.is_set():
+            now = time.time()
+            with self.lock:
+                t = self.t
+            if t >= 6.0 and now - last >= interval and not self._busy:
+                last = now
+                try:
+                    self._cycle()
+                except Exception:
+                    log.exception("живой цикл сорвался")
+            self._stop.wait(0.25)
+
+    def _cycle(self):
+        with self.lock:
+            t = self.t
+            start_s = max(0.0, self.cut_s - float(self.cfg.get("context_s", 2)))
+            audio = self._slice(start_s, t)
+        if len(audio) < 1600:
+            return
+        t0 = time.time()
+        self._busy = True
+        try:
+            segs, _ = self.app.transcriber.transcribe_segments(audio)
+        finally:
+            self._busy = False
+        log.info("live: %.0f с аудио -> %d сегм. за %.1f с",
+                 len(audio) / 16000, len(segs), time.time() - t0)
+        if self._stop.is_set():
+            return
+        draft_s = float(self.cfg.get("draft_s", 4))
+        with self.lock:
+            freeze_until = max(self.cut_s, t - draft_s)
+            old_cut = self.cut_s
+            new_conf, new_draft = [], []
+            new_frozen, new_draft_segs = [], []
+            for s, e, txt in segs:
+                s_abs, e_abs = start_s + s, start_s + e
+                if e_abs <= freeze_until:
+                    # Новая «замороженная» часть; пересечение со старым — отбросить.
+                    if s_abs < old_cut - 0.05:
+                        ratio = (old_cut - s_abs) / max(1e-6, e_abs - s_abs)
+                        txt = _suffix_chars(txt, ratio)
+                        s_abs = old_cut
+                    if txt:
+                        new_conf.append(txt)
+                        new_frozen.append((s_abs, e_abs, txt))
+                else:
+                    # Черновик: всё, что ещё не подтверждено. Режем только на
+                    # границе подтверждённого (old_cut) — раньше freeze_until
+                    # резать нельзя: это создавало «слепое» окно в ~draft_s.
+                    if s_abs < old_cut - 0.05:
+                        ratio = (old_cut - s_abs) / max(1e-6, e_abs - s_abs)
+                        txt = _suffix_chars(txt, ratio)
+                        s_abs = old_cut
+                    if txt:
+                        new_draft.append(txt)
+                        new_draft_segs.append((s_abs, e_abs, txt))
+            if new_conf:
+                self.confirmed = (self.confirmed + " " + " ".join(new_conf)).strip()
+                self.frozen_segs.extend(new_frozen)
+            self.cut_s = max(self.cut_s, freeze_until)
+            self.draft = " ".join(new_draft).strip()
+            self.draft_segs = new_draft_segs
+            confirmed, draft = self.confirmed, self.draft
+        self.app.on_live_update(self.sid, confirmed, draft, self.t)
+
+    # ── удаление слова / предложения ──
+
+    def delete(self, kind):
+        """kind: 'char' | 'word' | 'phrase'. Срезает текст И аудио; True если что-то было.
+
+        Смысл одинаковый в живом и в режиме правки, только здесь срез идёт
+        до конца текста (клавиша «стирает последнее сказанное»):
+          char   — один символ
+          word   — последнее слово
+          phrase — последнюю фразу (до последней точки/«!«?«…» или переноса
+                   строки; границ нет — весь хвост)
+        """
+        with self.lock:
+            text = (self.confirmed + " " + self.draft).strip()
+            if not text:
+                return False
+            if kind == "char":
+                end = len(text) - 1
+            elif kind == "word":
+                m = re.search(r"\S+$", text)
+                end = m.start() if m else 0
+            else:  # phrase
+                ms = list(re.finditer(r"[.!?…]+\s+|\n+", text))
+                end = ms[-1].end() if ms else 0
+            new_text = text[:end].strip()
+            t_cut = max(0.0, min(self.t, self._char_time(end, kind)))
+            self._truncate(t_cut)
+            self.confirmed = new_text
+            self.draft = ""
+            self.cut_s = t_cut
+            # Сегменты, вылезшие за обрез: отбросить, следующий цикл пересоберёт.
+            self.frozen_segs = [sg for sg in self.frozen_segs if sg[1] <= t_cut + 0.4]
+            self.draft_segs = []
+        log.info("live: %s удалено -> %d симв., аудио %.1f с",
+                 {"char": "символ", "word": "слово", "phrase": "фраза"}[kind],
+                 len(new_text), t_cut)
+        self.app.on_live_update(self.sid, self.confirmed, "", self.t)
+        beep("tick")
+        return True
+
+    def _char_time(self, pos, kind):
+        """Позиция символа в display-тексте -> примерное время в буфере.
+        Вызывать под self.lock."""
+        if pos <= 0:
+            return 0.0
+        confirmed = self.confirmed
+        if pos <= len(confirmed):
+            base = 0
+            for s, e, txt in self.frozen_segs:
+                L = len(txt) + 1
+                if pos <= base + L:
+                    inside = max(0, min(L - 1, pos - base - 1))
+                    return s + (e - s) * (inside / max(1, L))
+                base += L
+            # Позиция раньше всех сегментов (или сегментов нет) — эвристика.
+            fallback = {"char": 0.15, "word": 1.0, "phrase": 4.0}.get(kind, 1.0)
+            return max(0.0, self.cut_s - fallback)
+        pos -= len(confirmed) + 1  # пробел между confirmed и draft
+        for s, e, txt in self.draft_segs:
+            L = len(txt) + 1
+            if pos <= L:
+                inside = max(0, min(L - 1, pos - 1))
+                return s + (e - s) * (inside / max(1, L))
+        return self.t
+
+
 # ------------------------------------------------------------------------- ввод
 
 
@@ -994,9 +1286,13 @@ class App:
         self.llm_ready = False
         self.fake_audio = None
         self.session_id = 0
+        self.last_sid = 0
         self.edit = {}
         self.target_hwnd = None
         self.last_wav = ""
+        self.live = None
+        # JSONL пишут запись/правка/чтение — один файл, общий лок.
+        self.jsonl_lock = threading.Lock()
 
     def warmup(self):
         try:
@@ -1033,6 +1329,12 @@ class App:
                 log.info("окно правки уже открыто — второй хоткей игнорирую")
                 self.ui and self.ui.flash()
                 return
+            if self.state == "done":
+                # Прежнее окно ещё открыто после копирования — закрываем и
+                # начинаем новую диктовку.
+                self.state = "idle"
+                self.edit = {}
+                self.live = None
             if self.state != "idle":
                 beep("error")
                 log.info("занят (%s), хоткей игнорирую", self.state)
@@ -1044,13 +1346,27 @@ class App:
             sid = self.session_id
             self.target_hwnd = user32.GetForegroundWindow()
             self.edit = {}
+            live = None
+            if not quick and self.cfg.get("live", {}).get("enabled", True):
+                live = LiveSession(self, sid)
+                self.live = live
+        if live is not None:
+            live.start()
         self._status("ЗАПИСЬ  0 с", "record")
-        threading.Thread(target=self._dictate, args=(sid, quick),
+        threading.Thread(target=self._dictate, args=(sid, quick, live),
                          name="dictate", daemon=True).start()
 
-    def _dictate(self, sid, quick):
+    def on_hotkey_main(self):
+        if self.ui:
+            self.ui.toggle_main()
+
+    def _dictate(self, sid, quick, live=None):
         started = time.time()
+        self.last_sid = sid
         try:
+            if live is not None:
+                self._dictate_live(sid, live, started)
+                return
             if self.fake_audio is not None:
                 audio, rate, outcome = self.fake_audio, 16000, "ok"
                 self._status("FAKE-ДИКТОВКА", "record")
@@ -1080,6 +1396,9 @@ class App:
                 self.last_wav = path.name if path else ""
 
             self._status("РАСПОЗНАЮ", "work")
+            with self.lock:
+                if self.state == "recording" and sid == self.session_id:
+                    self.state = "recognizing"
             t_asr = time.time()
             text, prob = self.transcriber.transcribe(audio16)
             asr_ms = int((time.time() - t_asr) * 1000)
@@ -1103,10 +1422,121 @@ class App:
             log.exception("диктовка сорвалась")
             beep("error")
             self._status(f"ОШИБКА: {exc}"[:120], "error", 3)
+            if live is not None:
+                live.stop()
         finally:
             with self.lock:
-                if self.state == "recording" and sid == self.session_id:
+                if self.state in ("recording", "recognizing") and sid == self.session_id:
                     self.state = "idle"
+
+    def _dictate_live(self, sid, live, started):
+        """Запись с живым черновиком: окно открыто сразу, текст льётся в него,
+        при остановке — финальный проход по всему (возможно, обрезанному) буферу."""
+        if self.fake_audio is not None:
+            self._fake_feed(sid, live)
+            outcome = "ok"
+        else:
+            _, rate, outcome = record_session(
+                self.stop_ev, self.cancel_ev,
+                lambda el: self._status(f"ЗАПИСЬ  {el:0.0f} с", "record"),
+                on_ready=lambda: (beep("start"), self.ui and self.ui.open_editor(
+                    sid, "",
+                    "запись — живой черновик · Esc — отмена",
+                    live=True)),
+                on_frame=live.on_frame,
+            )
+        if outcome == "cancel":
+            self._cancel_session(sid, live)
+            return
+        # Весь звук — из буфера живого движка: 16 кГц и с учётом всех срезов
+        # (Backspace/Ctrl+Backspace/Ctrl+Shift+Backspace).
+        audio = live.take_all()
+        beep("stop")
+        duration = len(audio) / 16000 if len(audio) else 0.0
+        if duration < self.cfg["min_seconds"]:
+            log.info("слишком коротко: %.2f с", duration)
+            self._cancel_session(sid, live, note="СЛИШКОМ КОРОТКО", write=False)
+            return
+        if self.cfg.get("save_audio"):
+            path = save_wav(audio, 16000, self.cfg, sid)
+            self.last_wav = path.name if path else ""
+        self._status("РАСПОЗНАЮ", "work")
+        if self.ui:
+            self.ui.editor_busy(sid, "Распознаю запись")
+        with self.lock:
+            if self.state == "recording" and sid == self.session_id:
+                self.state = "recognizing"
+        t_asr = time.time()
+        text, prob = self.transcriber.transcribe(audio)
+        asr_ms = int((time.time() - t_asr) * 1000)
+        log.info("ASR: %.1f с звука -> %d симв. за %d мс (lang_prob=%s)",
+                 duration, len(text), asr_ms, prob)
+        live.stop()
+        with self.lock:
+            if sid != self.session_id:
+                self.live = None
+                return
+            self.state = "editing"
+            self.edit = {"raw": text, "sec": round(duration, 2), "asr_ms": asr_ms,
+                         "llm_ms": 0, "smart": False, "final": text, "mode": "editor",
+                         "wav": getattr(self, "last_wav", "")}
+            self.live = None
+        if not text.strip():
+            beep("error")
+            if self.ui:
+                self.ui.editor_error(sid, "Ничего не расслышал")
+            self._status("НИЧЕГО НЕ РАССЛЫШАЛ", "error", 1.5)
+            return
+        meta = (f"{duration:.1f} с речи · распознано за {asr_ms / 1000:.1f} с · "
+                f"{len(text)} символов")
+        if self.ui:
+            self.ui.editor_result(sid, text, meta)
+        log.info("живая диктовка готова за %.1f с", time.time() - started)
+
+    def _fake_feed(self, sid, live):
+        """--fake: WAV сливается в живой движок кусками, как если бы это был микрофон."""
+        audio = self.fake_audio
+        beep("start")
+        self._status("FAKE-ДИКТОВКА", "record")
+        chunk = int(16000 * 0.5)
+        opened = False
+        for i in range(0, len(audio), chunk):
+            if self.stop_ev.is_set() or self.cancel_ev.is_set():
+                break
+            live.on_frame(audio[i:i + chunk], 16000)
+            if not opened:
+                opened = True
+                if self.ui:
+                    self.ui.open_editor(
+                        sid, "",
+                        "FAKE-запись из файла · живой черновик · Esc — отмена",
+                        live=True)
+            time.sleep(0.15)
+        time.sleep(0.3)
+
+    def _cancel_session(self, sid, live=None, note="ОТМЕНЕНО", write=True):
+        if live:
+            live.stop()
+        with self.lock:
+            if sid != self.session_id:
+                return
+            partial = live.display_text() if live else ""
+            self.state = "idle"
+            self.edit = {}
+            self.session_id += 1
+            self.live = None
+        beep("stop")
+        self._status(note, "error", 1.2)
+        if write and partial:
+            self._write_jsonl({
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "action": "cancel",
+                "mode": "editor",
+                "chars": len(partial),
+                "raw": partial,
+                "final": "",
+            })
+        log.info("запись отменена (%s)", note)
 
     def _show_editor(self, sid, text, duration, asr_ms):
         with self.lock:
@@ -1129,37 +1559,113 @@ class App:
                 f"{len(text)} символов")
         self.ui.open_editor(sid, text, meta)
 
-    # ── кнопки окна правки ────────────────────────────────────────────────
+    # ── кнопки окна ────────────────────────────────────────────────────────
 
-    def on_ui_send(self, sid, text):
+    def on_copy(self, sid, text):
+        """«Копировать в буфер»: текст в буфер, запись в JSONL, окно остаётся
+        открытым — можно поправить и скопировать ещё раз."""
         with self.lock:
-            if sid != self.session_id or self.state != "editing":
+            if sid != self.session_id or self.state not in ("editing", "done"):
                 return
             info = dict(self.edit)
             info["final"] = text
-        threading.Thread(target=self._deliver, args=(sid, text, info, True),
-                         name="send", daemon=True).start()
+        ok = set_clipboard(text)
+        if ok:
+            beep("done")
+            self._status("СКОПИРОВАНО", "done", 1.5)
+        else:
+            beep("error")
+            self._status("НЕ СКОПИРОВАЛОСЬ", "error", 3)
+        self._write_jsonl({
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "action": "copy" if ok else "fail",
+            "mode": info.get("mode", "editor"),
+            "sec": info.get("sec"),
+            "asr_ms": info.get("asr_ms"),
+            "llm_ms": info.get("llm_ms", 0),
+            "smart": bool(info.get("smart")),
+            "inject": "clipboard" if ok else "",
+            "chars": len(text),
+            "raw": info.get("raw", text),
+            "final": text,
+            "wav": info.get("wav", ""),
+        })
+        with self.lock:
+            if sid == self.session_id:
+                self.state = "done"
+
+    def on_stop(self, sid):
+        """«Стоп» в живом режиме: запись кончилась, идёт финальное распознавание."""
+        with self.lock:
+            if sid != self.session_id or self.state != "recording":
+                return
+        self.stop_ev.set()
+        self._status("РАСПОЗНАЮ", "work")
+
+    def on_live_delete(self, kind):
+        """Клавиши стирания во время записи: 'char' | 'word' | 'phrase'."""
+        live = self.live
+        if live is None:
+            return
+        try:
+            live.delete(kind)
+        except Exception:
+            log.exception("live-delete сорвался")
+
+    def on_live_update(self, sid, confirmed, draft, t):
+        if self.ui and sid == self.session_id:
+            self.ui.editor_live(
+                sid, confirmed, draft,
+                f"ЗАПИСЬ {t:.0f} с · жёлтым — ещё не заморожено")
 
     def on_ui_formulate(self, sid, text):
         threading.Thread(target=self._formulate, args=(sid, text),
                          name="formulate", daemon=True).start()
 
-    def on_ui_cancel(self, sid):
+    def on_close(self, sid, text):
+        """Окно закрыто (Esc, ×, «Отмена»). Во время записи — отмена сессии,
+        в режиме правки — автосохранение правок."""
         with self.lock:
             if sid != self.session_id:
                 return
+            state = self.state
             info = self.edit
-            self.state = "idle"
-            self.edit = {}
-            self.session_id += 1
+        if state in ("recording", "recognizing"):
+            # Отмена: события ставим, хвост доделает _dictate/_dictate_live.
+            self.cancel_ev.set()
+            self.stop_ev.set()
+            log.info("запись отменена (Esc в окне)")
+            return
+        if state == "done":
+            with self.lock:
+                self.state = "idle"
+                self.edit = {}
+            log.info("окно закрыто после копирования")
+            return
+        if state == "formulating":
+            # Esc во время формулировки — это «вернуться назад», а не
+            # отмена записи: останавливаем тред и сохраняем текущий текст.
+            self.abort_ev.set()
+        # editing/formulating: правки сохраняем, даже если окно просто закрыли.
+        raw = (info.get("raw") or "") if info else ""
+        final = text.strip() if (text.strip() and text.strip() != raw.strip()) else ""
         self._write_jsonl({
             "ts": datetime.now().isoformat(timespec="seconds"),
             "action": "cancel",
             "mode": "editor",
-            "chars": len(info.get("raw", "")),
-            "raw": info.get("raw", ""),
+            "sec": info.get("sec") if info else None,
+            "asr_ms": info.get("asr_ms") if info else None,
+            "chars": len(raw),
+            "raw": raw,
+            "final": final,
+            "wav": (info or {}).get("wav", ""),
         })
-        log.info("окно правки закрыто без отправки")
+        with self.lock:
+            self.state = "idle"
+            self.edit = {}
+            self.session_id += 1
+        log.info("окно правки закрыто без копирования%s",
+                 " (правки сохранены)" if final else "")
 
     def _formulate(self, sid, text):
         with self.lock:
@@ -1211,12 +1717,23 @@ class App:
                 or self.abort_ev.is_set())
 
     def on_ui_abort(self, sid):
+        closed = False
         with self.lock:
-            if sid != self.session_id or self.state != "formulating":
+            if sid != self.session_id or self.state not in ("formulating", "recognizing"):
                 return
             self.abort_ev.set()
-            self.state = "editing"
-        log.info("формулировка отменена пользователем")
+            if self.state == "formulating":
+                self.state = "editing"
+            else:
+                # «Распознаю запись»: проход догонит молча, результат отбросим.
+                self.state = "idle"
+                self.edit = {}
+                self.session_id += 1
+                self.live = None
+                closed = True
+        if closed and self.ui:
+            self.ui.close_editor(sid)
+        log.info("операция отменена пользователем")
 
     def _restore_target(self):
         hwnd = self.target_hwnd
@@ -1306,10 +1823,80 @@ class App:
         try:
             LOGS.mkdir(parents=True, exist_ok=True)
             path = LOGS / f"dictate-{datetime.now():%Y-%m-%d}.jsonl"
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+            with self.jsonl_lock:
+                with path.open("a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception as exc:
             log.debug("не смог записать jsonl: %s", exc)
+
+    # ── данные для главного окна ───────────────────────────────────────────
+
+    def get_history(self, limit=60):
+        """Последние записи (сегодня + вчера), новые сверху."""
+        rows = []
+        today = datetime.now()
+        for day in (today, today - timedelta(days=1)):
+            path = LOGS / f"dictate-{day:%Y-%m-%d}.jsonl"
+            if not path.exists():
+                continue
+            try:
+                with self.jsonl_lock:
+                    lines = path.read_text(encoding="utf-8").splitlines()
+            except Exception:
+                continue
+            for line in lines:
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if row.get("action") in ("copy", "send", "cancel", "quick"):
+                    rows.append(row)
+        rows = rows[-limit:]
+        rows.reverse()
+        return rows
+
+    def get_log_tail(self, lines=150):
+        path = LOGS / "dictate.log"
+        if not path.exists():
+            return ""
+        try:
+            data = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            return "\n".join(data[-lines:])
+        except Exception:
+            return ""
+
+    def update_entry_final(self, ts, final):
+        """Перезаписать final у записи с таким ts (правка в главном окне).
+        final='' — откатить к распознанному (как «не редактировали»)."""
+        if not ts:
+            return
+        today = datetime.now()
+        for day in (today, today - timedelta(days=1)):
+            path = LOGS / f"dictate-{day:%Y-%m-%d}.jsonl"
+            if not path.exists():
+                continue
+            try:
+                with self.jsonl_lock:
+                    lines = path.read_text(encoding="utf-8").splitlines()
+                    done = False
+                    for i in range(len(lines) - 1, -1, -1):
+                        if lines[i].strip().startswith('{"ts": "' + ts):
+                            try:
+                                row = json.loads(lines[i])
+                            except Exception:
+                                continue
+                            row["final"] = final
+                            lines[i] = json.dumps(row, ensure_ascii=False)
+                            done = True
+                            break
+                    if done:
+                        path.write_text("\n".join(lines) + ("\n" if lines else ""),
+                                        encoding="utf-8", newline="\n")
+                log.info("правка записи %s сохранена (%d симв.)", ts, len(final))
+                return
+            except Exception as exc:
+                log.warning("не смог сохранить правку записи: %s", exc)
+                return
 
 
 def single_instance():
@@ -1328,10 +1915,15 @@ def run_app(cfg, fake=None):
 
     app = App(cfg)
     app.ui = VoiceUI(
-        on_send=app.on_ui_send,
+        on_copy=app.on_copy,
+        on_stop=app.on_stop,
         on_formulate=app.on_ui_formulate,
-        on_cancel=app.on_ui_cancel,
+        on_close=app.on_close,
         on_abort=app.on_ui_abort,
+        on_live_delete=app.on_live_delete,
+        history_fn=app.get_history,
+        log_fn=app.get_log_tail,
+        save_edit_fn=app.update_entry_final,
         enabled=True,
         status_enabled=bool(cfg.get("overlay", True)),
         min_smart_chars=int(cfg["llm"].get("min_smart_chars", 0) or 0),
@@ -1340,21 +1932,23 @@ def run_app(cfg, fake=None):
 
     mods_main, vk_main = parse_hotkey(cfg["hotkey"])
     mods_raw, vk_raw = parse_hotkey(cfg["hotkey_raw"])
+    mods_main_win, vk_main_win = parse_hotkey(cfg.get("hotkey_main", "ctrl+alt+shift+d"))
     ids = {}
-    for hotkey_id, (mods, vk, raw) in {
-        1: (mods_main, vk_main, False),
-        2: (mods_raw, vk_raw, True),
+    for hotkey_id, (mods, vk, name) in {
+        1: (mods_main, vk_main, cfg["hotkey"]),
+        2: (mods_raw, vk_raw, cfg["hotkey_raw"]),
+        3: (mods_main_win, vk_main_win, cfg.get("hotkey_main", "ctrl+alt+shift+d")),
     }.items():
         if user32.RegisterHotKey(None, hotkey_id, mods | MOD_NOREPEAT, vk):
-            ids[hotkey_id] = raw
+            ids[hotkey_id] = name
         else:
-            log.error("хоткей %s занят другой программой", cfg["hotkey"] if not raw else cfg["hotkey_raw"])
-    if not ids:
-        print("не смог занять ни одного хоткея", file=sys.stderr)
+            log.error("хоткей %s занят другой программой", name)
+    if 1 not in ids:
+        print("не смог занять основной хоткей", file=sys.stderr)
         return 2
 
-    log.info("диктовщик запущен: %s = диктовка с окном правки, %s = быстрый ввод",
-             cfg["hotkey"], cfg["hotkey_raw"])
+    log.info("диктовщик запущен: %s = диктовка, %s = главное окно, %s = быстрый ввод",
+             cfg["hotkey"], cfg.get("hotkey_main", "ctrl+alt+shift+d"), cfg["hotkey_raw"])
 
     if fake:
         app.fake_audio = load_wav(fake)
@@ -1370,8 +1964,13 @@ def run_app(cfg, fake=None):
         if ret == 0 or ret == -1:
             break
         if msg.message == WM_HOTKEY:
-            quick = ids.get(int(msg.wParam), False)
-            app.on_hotkey(quick=quick)
+            wid = int(msg.wParam)
+            if wid == 1:
+                app.on_hotkey(quick=False)
+            elif wid == 2:
+                app.on_hotkey(quick=True)
+            elif wid == 3:
+                app.on_hotkey_main()
     log.info("диктовщик остановлен")
     return 0
 

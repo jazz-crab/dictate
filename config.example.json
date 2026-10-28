@@ -1,5 +1,6 @@
 {
   "hotkey": "ctrl+alt+d",
+  "hotkey_main": "ctrl+alt+shift+d",
   "hotkey_raw": "ctrl+alt+s",
   "input_device": "",
   "sample_rate": 16000,
@@ -10,8 +11,14 @@
   "save_audio": false,
   "ollama_exe": "ollama/ollama.exe",
   "ollama_url": "http://127.0.0.1:11434",
+  "live": {
+    "enabled": true,
+    "draft_s": 4.0,
+    "interval_s": 9.0,
+    "context_s": 2.0
+  },
   "whisper": {
-    "model_dir": "models/small",
+    "model_dir": "models/turbo",
     "device": "cpu",
     "compute_type": "int8",
     "beam_size": 5,
