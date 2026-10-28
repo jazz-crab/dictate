@@ -18,9 +18,9 @@
     "language": "ru",
     "threads": 4,
     "vad": true,
-    "vad_threshold": 0.35,
+    "vad_threshold": 0.10,
     "vad_min_silence_ms": 500,
-    "vad_speech_pad_ms": 500
+    "vad_speech_pad_ms": 1000
   },
   "llm": {
     "enabled": true,
