@@ -107,7 +107,10 @@ DEFAULTS = {
     # в подтверждённый текст, свежий хвост показывается акцентным цветом.
     # На CPU это ~10-секундные обновления; с ускоренным ASR станет быстрее.
     "live": {
-        "enabled": True,
+        # Живой черновик пока выключен: на CPU хвост распознаётся дольше,
+        # чем человек говорит, и окно «догоняет» речь рывками. Стабильный
+        # сценарий — плашка «ЗАПИСЬ» → «РАСПОЗНАЮ» → окно с готовым текстом.
+        "enabled": False,
         "draft_s": 4.0,
         "interval_s": 9.0,
         "context_s": 2.0,
@@ -1347,7 +1350,7 @@ class App:
             self.target_hwnd = user32.GetForegroundWindow()
             self.edit = {}
             live = None
-            if not quick and self.cfg.get("live", {}).get("enabled", True):
+            if not quick and self.cfg.get("live", {}).get("enabled", False):
                 live = LiveSession(self, sid)
                 self.live = live
         if live is not None:

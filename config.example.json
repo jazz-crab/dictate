@@ -12,7 +12,7 @@
   "ollama_exe": "ollama/ollama.exe",
   "ollama_url": "http://127.0.0.1:11434",
   "live": {
-    "enabled": true,
+    "enabled": false,
     "draft_s": 4.0,
     "interval_s": 9.0,
     "context_s": 2.0

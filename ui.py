@@ -94,6 +94,8 @@ class VoiceUI:
         self._q = queue.Queue()
         self._sid = 0
         self._editor = None
+        # Окно правки по умолчанию поверх всех; открепляется галочкой в шапке.
+        self._pinned = True
         self._pill = None
         self._main = None
         self._source = ""
@@ -231,7 +233,7 @@ class VoiceUI:
         # Обычное окно: заголовок, панель задач, «Свернуть», ручное изменение
         # размера — а ещё авто-рост по мере роста текста (см. _place).
         ed.title("Диктовка")
-        ed.attributes("-topmost", True)
+        ed.attributes("-topmost", bool(self._pinned))
         ed.configure(bg=BORDER)
         try:
             if APP_ICON.exists():
@@ -254,6 +256,17 @@ class VoiceUI:
                           highlightthickness=0)
         close.pack(side="right")
         _hover(close, BG_POPUP, BG_SOFT, COMMENT, FG)
+        # Открепление: «поверх всех» — галочка, а не навсегда. Нажата —
+        # окно висит над другими (как раньше), снята — живёт обычной жизнью.
+        self._pin_var = tk.BooleanVar(value=self._pinned)
+        pin = tk.Checkbutton(head, text="поверх всех", variable=self._pin_var,
+                             command=self._toggle_pin,
+                             bg=BG_POPUP, fg=COMMENT, activebackground=BG_POPUP,
+                             activeforeground=FG, selectcolor=BG_SOFT,
+                             indicatoron=0, bd=0, relief="flat", overrelief="flat",
+                             font=(MONO, 8), padx=6, pady=0, cursor="hand2",
+                             takefocus=0, highlightthickness=0)
+        pin.pack(side="right", padx=(0, 8))
 
         meta = tk.Label(body, text="", bg=BG_POPUP, fg=COMMENT, font=(MONO, 9),
                         anchor="w", justify="left")
@@ -432,11 +445,12 @@ class VoiceUI:
         ed.update_idletasks()
         ed.update()
         ed.lift()
-        ed.attributes("-topmost", True)
-        try:
-            _force_foreground(ed)
-        except Exception:
-            pass
+        ed.attributes("-topmost", bool(self._pinned))
+        if self._pinned:
+            try:
+                _force_foreground(ed)
+            except Exception:
+                pass
         ed.focus_force()
         self._text.focus_force()
         self._text.mark_set("insert", "1.0")
@@ -557,10 +571,10 @@ class VoiceUI:
         # В Tk <Control-z> и <Control-Z> — одна и та же клавиша: shift
         # различается только явным модификатором, поэтому redo — только
         # через <Control-Shift-Z> / <Control-y>.
-        self._text.bind("<Control-z>", lambda e: self._undo_redo("<<Undo>>"))
-        self._text.bind("<Control-Shift-Z>", lambda e: self._undo_redo("<<Redo>>"))
-        self._text.bind("<Control-Shift-z>", lambda e: self._undo_redo("<<Redo>>"))
-        self._text.bind("<Control-y>", lambda e: self._undo_redo("<<Redo>>"))
+        self._text.bind("<Control-z>", lambda e: self._undo_redo("undo"))
+        self._text.bind("<Control-Shift-Z>", lambda e: self._undo_redo("redo"))
+        self._text.bind("<Control-Shift-z>", lambda e: self._undo_redo("redo"))
+        self._text.bind("<Control-y>", lambda e: self._undo_redo("redo"))
         self._text.bind("<Control-c>", self._copy_selection)
         self._text.bind("<Control-Shift-c>", self._copy_all)
 
@@ -570,11 +584,15 @@ class VoiceUI:
             self.on_live_delete(kind)
         return "break"
 
-    def _undo_redo(self, virtual):
+    def _undo_redo(self, which):
+        """'undo' | 'redo' — прямыми вызовами Text.edit_undo/redo."""
         if str(self._text["state"]) == "disabled":
             return "break"
         try:
-            self._text.event_generate(virtual)
+            if which == "undo":
+                self._text.edit_undo()
+            else:
+                self._text.edit_redo()
         except Exception:
             pass
         return "break"
@@ -775,22 +793,43 @@ class VoiceUI:
                 pass
             self._anim_job = None
 
+    def _toggle_pin(self):
+        """Галочка «поверх всех» в шапке окна правки."""
+        self._pinned = bool(self._pin_var.get())
+        try:
+            self._editor.attributes("-topmost", self._pinned)
+        except Exception:
+            pass
+        if self._pinned:
+            try:
+                self._editor.lift()
+            except Exception:
+                pass
+
     def _start_progress(self):
-        """Бегущая полоска: 40 кадров в секунду, но каждый — два вызова Canvas."""
+        """Бегущая полоска: 60 кадров в секунду, прямоугольник двигаем, а не
+        пересоздаём. Позиция считается от времени старта — даже если Tk
+        пропустит кадр, полоска не «дёрнется» назад."""
         self._stop_progress()
         canvas = self._progress
         canvas.configure(bg=BG_SOFT)
         self._progress_on = True
-        span = 120
+        span = 140
+        t0 = time.time()
+        canvas.delete("bar")
+        canvas.create_rectangle(-span, 0, 0, 3, fill=BLUE, width=0, tags="bar")
 
         def step():
             if not self._progress_on:
                 return
             width = max(canvas.winfo_width(), 1)
-            pos = (time.time() * 420) % (width + span) - span
-            canvas.delete("bar")
-            canvas.create_rectangle(pos, 0, pos + span, 3, fill=BLUE, width=0, tags="bar")
-            self._progress_job = canvas.after(40, step)
+            elapsed = time.time() - t0
+            pos = (elapsed * 300) % (width + span) - span
+            try:
+                canvas.coords("bar", pos, 0, pos + span, 3)
+            except Exception:
+                return
+            self._progress_job = canvas.after(16, step)
 
         step()
 
